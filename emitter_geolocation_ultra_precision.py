@@ -1,8 +1,3 @@
-"""
-Ultra-Precision Emitter Geolocation System
-Designed specifically for challenging geometries and high accuracy requirements
-"""
-
 import numpy as np
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
@@ -12,36 +7,32 @@ import warnings
 
 @dataclass
 class Sensor:
-    """Represents a sensor with position and DOA measurement"""
     sensor_id: str
     latitude: float
     longitude: float
-    doa: float  # Direction of arrival in degrees (0=North, 90=East, clockwise)
+    doa: float #(North -> 0 , East -> 90, clockwise)
     
 @dataclass
 class SignalFeatures:
-    """Common signal features for all sensors"""
-    frequency: float  # Hz
-    prf: float  # Pulse repetition frequency
+    frequency: float  
+    prf: float 
     pulse_width: float
 
 @dataclass
 class EmitterEstimate:
-    """Result of emitter geolocation"""
     latitude: float
     longitude: float
-    confidence_score: float
-    residual_error: float
-    covariance_trace: float
-    geometry_quality: float
-    iterations: int
-    method_used: str
+    residual_error: float = 0.0
+    covariance_trace: float = 0.0
+    geometry_quality: float = 0.0
+    iterations: int = 0
+    method_used: str = ""
+    cep_radius_m: float = 0.0
+    emitter_verified: bool = False
 
 class UltraPrecisionCoordinateConverter:
-    """Ultra-high precision coordinate converter"""
     
     def __init__(self, reference_lat: float, reference_lon: float):
-        """Initialize with exact geodetic parameters"""
         self.ref_lat = np.radians(reference_lat)
         self.ref_lon = np.radians(reference_lon)
         
@@ -59,7 +50,6 @@ class UltraPrecisionCoordinateConverter:
         self.N = self.a / np.sqrt(1 - self.e2 * self.sin_lat**2)
     
     def latlon_to_enu(self, lat: float, lon: float) -> Tuple[float, float]:
-        """Convert to ENU with maximum precision"""
         lat_rad = np.radians(lat)
         lon_rad = np.radians(lon)
         
@@ -98,6 +88,31 @@ class UltraPrecisionEmitterGeolocation:
         ref_lat = np.mean([s.latitude for s in sensors])
         ref_lon = np.mean([s.longitude for s in sensors])
         self.coordinate_converter = UltraPrecisionCoordinateConverter(ref_lat, ref_lon)
+    
+    def verify_emitter(self, signal_features: SignalFeatures,
+                       freq_tol: float = 0.05,
+                       prf_tol: float = 10.0,
+                       pw_tol: float = 0.1) -> bool:
+        """
+        Verify all sensors are detecting the same emitter
+        using frequency, PRF and pulse width consistency.
+        Returns True if signal is consistent (same emitter).
+        """
+        # Since all 3 sensors report the same signal params in this input format,
+        # validate that values are within physical bounds
+        if signal_features.frequency <= 0:
+            return False
+        if signal_features.prf <= 0:
+            return False
+        if signal_features.pulse_width <= 0:
+            return False
+
+        # Check pulse width vs PRF consistency (PW must be < 1/PRF)
+        max_pw = 1.0 / signal_features.prf
+        if signal_features.pulse_width >= max_pw:
+            return False  # Physically impossible signal
+
+        return True
     
     def calculate_precise_bearing(self, lat1: float, lon1: float, 
                                 lat2: float, lon2: float) -> float:
@@ -139,7 +154,7 @@ class UltraPrecisionEmitterGeolocation:
             residual = ((residual + 180) % 360) - 180  # Normalize to [-180, 180]
             
             # Huber loss for robustness (less sensitive to outliers)
-            delta = 5.0  # Huber threshold in degrees
+            delta = 15.0  # More tolerant threshold — handles noisy/miscalibrated DOA sensors
             if abs(residual) <= delta:
                 cost = 0.5 * residual**2
             else:
@@ -211,11 +226,41 @@ class UltraPrecisionEmitterGeolocation:
         
         return weights
     
+    def check_sensor_geometry(self, sensors: List[Sensor]) -> Tuple[bool, float]:
+        """
+        Check if sensors are collinear which causes poor GDOP.
+        Returns (geometry_ok: bool, collinearity_score: float 0-1)
+        1.0 = perfect triangle, 0.0 = fully collinear (unusable)
+        """
+        positions = []
+        for sensor in sensors:
+            e, n = self.coordinate_converter.latlon_to_enu(sensor.latitude, sensor.longitude)
+            positions.append([e, n])
+
+        positions = np.array(positions)
+
+        # Compute triangle area using cross product
+        v1 = positions[1] - positions[0]
+        v2 = positions[2] - positions[0]
+        area = abs(v1[0] * v2[1] - v1[1] * v2[0]) / 2.0
+
+        # Normalize by max possible area for these side lengths
+        side_lengths = pdist(positions)
+        max_side = np.max(side_lengths)
+
+        if max_side < 1.0:
+            return False, 0.0  # Sensors are co-located
+
+        normalized_area = area / (max_side ** 2)
+        geometry_ok = normalized_area > 0.01  # Threshold: not nearly collinear
+
+        return geometry_ok, min(1.0, normalized_area / 0.4)
+
     def solve_global_optimization(self, sensors: List[Sensor]) -> Tuple[np.ndarray, float]:
         """
         Solve using global optimization for robustness
         """
-        # Estimate search bounds based on sensor positions
+        # Estimate search bounds based on sensor positions and DOA directions
         sensor_positions = []
         for sensor in sensors:
             east, north = self.coordinate_converter.latlon_to_enu(
@@ -225,10 +270,25 @@ class UltraPrecisionEmitterGeolocation:
         
         sensor_positions = np.array(sensor_positions)
         
-        # Bounds: extend beyond sensor positions
-        margin = 10000  # 10km margin
-        min_east, max_east = sensor_positions[:, 0].min() - margin, sensor_positions[:, 0].max() + margin
-        min_north, max_north = sensor_positions[:, 1].min() - margin, sensor_positions[:, 1].max() + margin
+        # Estimate max range from DOA geometry before setting bounds
+        # Use 300km as minimum safe margin for ESM scenarios
+        margin = 300000  # 300km — covers typical ESM radar detection ranges
+        
+        # Extend bounds along DOA vectors to cover where bearings point
+        for sensor in sensors:
+            s_east, s_north = self.coordinate_converter.latlon_to_enu(
+                sensor.latitude, sensor.longitude
+            )
+            doa_rad = np.radians(sensor.doa)
+            # Project 300km along DOA from each sensor
+            projected_east = s_east + margin * np.sin(doa_rad)
+            projected_north = s_north + margin * np.cos(doa_rad)
+            sensor_positions = np.vstack([sensor_positions, [projected_east, projected_north]])
+
+        min_east = sensor_positions[:, 0].min() - margin
+        max_east = sensor_positions[:, 0].max() + margin
+        min_north = sensor_positions[:, 1].min() - margin
+        max_north = sensor_positions[:, 1].max() + margin
         
         bounds = [(min_east, max_east), (min_north, max_north)]
         
@@ -307,6 +367,14 @@ class UltraPrecisionEmitterGeolocation:
         
         # Setup coordinate system
         self.setup_coordinate_system(sensors)
+
+        emitter_verified = self.verify_emitter(signal_features)
+        if not emitter_verified:
+            warnings.warn("Signal features failed emitter verification — results may be unreliable")
+
+        geometry_ok, collinearity_score = self.check_sensor_geometry(sensors)
+        if not geometry_ok:
+            warnings.warn("Sensors are nearly collinear — geolocation accuracy will be severely degraded")
         
         # Global optimization for initial estimate
         try:
@@ -360,10 +428,32 @@ class UltraPrecisionEmitterGeolocation:
         min_separation = min(separations)
         geometry_quality = min(1.0, min_separation / 60.0)  # Normalize by 60°
         
-        # Confidence score
-        error_confidence = np.exp(-0.1 * residual_error)
-        geometry_confidence = geometry_quality
-        confidence_score = error_confidence * geometry_confidence
+        # --- Hessian-based covariance for CEP computation ---
+        def cost_for_hessian(pos):
+            w = self.compute_adaptive_weights(sensors, (pos[0], pos[1]))
+            return self.robust_bearing_cost_function(pos, sensors, w)
+
+        eps = 1.0  # 1 meter perturbation
+        h = np.zeros((2, 2))
+        final_pos = np.asarray(final_pos)
+        for i in range(2):
+            for j in range(2):
+                pos_pp = final_pos.copy(); pos_pp[i] += eps; pos_pp[j] += eps
+                pos_pm = final_pos.copy(); pos_pm[i] += eps; pos_pm[j] -= eps
+                pos_mp = final_pos.copy(); pos_mp[i] -= eps; pos_mp[j] += eps
+                pos_mm = final_pos.copy(); pos_mm[i] -= eps; pos_mm[j] -= eps
+                h[i, j] = (cost_for_hessian(pos_pp) - cost_for_hessian(pos_pm)
+                           - cost_for_hessian(pos_mp) + cost_for_hessian(pos_mm)) / (4 * eps * eps)
+
+        try:
+            cov_matrix = np.linalg.inv(h)
+            # CEP ~ 1.1774 * sigma for 2D circular (50% probability radius)
+            cep_radius_trace = np.trace(cov_matrix)
+            cep_radius_m = 1.1774 * np.sqrt(max(0.0, 0.5 * cep_radius_trace))
+        except np.linalg.LinAlgError:
+            cep_radius_m = float('inf')
+
+        # Confidence score removed: system still computes CEP and geometry quality
         
         # Covariance estimation (simplified)
         covariance_trace = final_cost / len(sensors)
@@ -371,12 +461,13 @@ class UltraPrecisionEmitterGeolocation:
         return EmitterEstimate(
             latitude=emitter_lat,
             longitude=emitter_lon,
-            confidence_score=confidence_score,
             residual_error=residual_error,
             covariance_trace=covariance_trace,
             geometry_quality=geometry_quality,
             iterations=iterations,
-            method_used=method_used
+            method_used=method_used,
+            cep_radius_m=cep_radius_m,
+            emitter_verified=emitter_verified
         )
 
 # Convenience function

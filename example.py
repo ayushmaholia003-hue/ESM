@@ -1,6 +1,3 @@
-"""
-Simple usage example for ultra-precision emitter geolocation system
-"""
 
 from emitter_geolocation_ultra_precision import UltraPrecisionEmitterGeolocation, Sensor, SignalFeatures
 
@@ -32,7 +29,6 @@ def main():
     print("Results:")
     print(f"  Latitude:  {result.latitude:.6f}°")
     print(f"  Longitude: {result.longitude:.6f}°")
-    print(f"  Confidence: {result.confidence_score:.4f}")
 
 if __name__ == "__main__":
     main()

@@ -45,7 +45,6 @@ result = geolocator.estimate_emitter_location(sensors, signal)
 
 print(f"Latitude:  {result.latitude:.6f}°")
 print(f"Longitude: {result.longitude:.6f}°")
-print(f"Confidence: {result.confidence_score:.4f}")
 print(f"Method: {result.method_used}")
 ```
 
@@ -59,7 +58,6 @@ scenario_id,sensor1_lat,sensor1_lon,sensor1_doa,sensor2_lat,sensor2_lon,sensor2_
 ## Output
 
 - **Latitude/Longitude**: Estimated emitter position (degrees)
-- **Confidence Score**: 0-1 (higher is better)
 - **Geometry Quality**: Sensor configuration quality metric
 - **Method Used**: Optimization algorithm employed
 
